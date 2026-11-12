@@ -1,254 +1,323 @@
-"""roblox-up-and-coming-forecast-01: forecast Roblox's Up-and-Coming top 10.
-
-Method: an empirical transition kernel over the chart's history. For every pair
-of past reads we record how games moved (rank now -> rank later, or left the
-chart). For each horizon h in a grid over the 72-hour scored window we estimate,
-per current-rank bucket, the distribution over future places 1..10 from those
-transitions (Gaussian kernel over the pair's time gap, recency-weighted), then
-average the per-horizon distributions over h (trapezoid weights) to get one
-static forecast. Games that age out of the chart (published > 28 days ago)
-contribute nothing past their expiry hour. No model calls, no network, no
-randomness: the output is a pure function of /input.
-"""
-
+import os
 import json
 import math
-import os
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
-# --- Tuned parameters: grid-searched on the true practice window (10 reads,
-# reconstructed from the public archive) + 4 rolling-origin cuts inside the
-# 34-read kit history. Final config: practice log score -35.182 vs house
-# baseline -43.512 (+8.33); mean over all 5 backtests -35.583 vs -41.820.
-# Rejected by the same backtests: cross-chart rank shifts (Top Trending /
-# Top Playing Now presence hurt everywhere), recency half-life != 168h
-# (negligible difference), horizon sigma != 6h, prior != 1.0.
-PARAMS = {
-    "horizon_sigma_h": 6.0,     # Gaussian kernel width over pair gap vs horizon
-    "recency_half_life_h": 168.0,  # pairs decay by recency of their later read
-    "prior": 1.0,               # Laplace pseudo-count per outcome
-    "max_named_per_place": 18,  # rows named per place (cap 100)
-    "scale_target": 0.75,       # renormalise each place's named mass to 0.75
-    "tt_shift_top": 0.0,        # rank shift if on Top Trending and rank <= 10
-    "tt_shift_mid": 0.0,        # rank shift if on Top Trending and rank > 10
-    "tpn_shift_top": 0.0,       # rank shift if on Top Playing Now and rank <= 10
-    "max_reads": 200,           # thin history to at most this many reads
-    "max_pair_gap_h": 84.0,
-}
-
-HORIZONS = [0, 2, 4, 6, 9, 12, 18, 24, 36, 48, 60, 72]
-# Rank-bucket centres for the transition kernel (exact 1..10, coarser below).
-BUCKETS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 18, 25, 40, 70]
-# Outcome indices: 0..9 = places 1..10, 10 = rank 11..97, 11 = left the chart.
-N_OUT = 12
-CHART_DAYS = 28.0
-
-
-def parse_time(s):
-    """ISO 8601 UTC -> epoch seconds (stdlib only)."""
-    s = s.replace("Z", "+00:00")
-    return __import__("datetime").datetime.fromisoformat(s).timestamp()
-
-
-def bucket_weights(rank):
-    """Linear interpolation weights over BUCKETS for a rank."""
-    if rank <= BUCKETS[0]:
-        return [(0, 1.0)]
-    if rank >= BUCKETS[-1]:
-        return [(len(BUCKETS) - 1, 1.0)]
-    for i in range(len(BUCKETS) - 1):
-        lo, hi = BUCKETS[i], BUCKETS[i + 1]
-        if lo <= rank <= hi:
-            if hi == lo:
-                return [(i, 1.0)]
-            f = (rank - lo) / (hi - lo)
-            return [(i, 1.0 - f), (i + 1, f)]
-    return [(len(BUCKETS) - 1, 1.0)]
-
-
-def build_forecast(reads, task, params=None):
-    p = dict(PARAMS)
-    if params:
-        p.update(params)
-    reads = sorted(reads, key=lambda r: r["at"])
-    # Thin long histories (final phase: hourly reads) to a deterministic stride.
-    last_read = reads[-1]
-    if len(reads) > p["max_reads"]:
-        stride = -(-len(reads) // p["max_reads"])
-        reads = reads[::stride]
-        if reads[-1] is not last_read:
-            reads = reads + [last_read]
-    times = [parse_time(r["at"]) for r in reads]
-    t0 = times[-1]
-    n = len(reads)
-    rank_of = []
-    for r in reads:
-        rank_of.append({g["universe_id"]: g["rank"] for g in r["up_and_coming"]})
-    tt_of = []
-    tpn_of = []
-    for r in reads:
-        tt_of.append({g["universe_id"] for g in (r.get("top_trending") or [])})
-        tpn_of.append({g["universe_id"] for g in (r.get("top_playing_now") or [])})
-
-    # --- transition counts: counts[h][bucket][outcome] ---
-    hsig = p["horizon_sigma_h"]
-    hl = p["recency_half_life_h"]
-    max_gap = p["max_pair_gap_h"]
-    counts = [[[0.0] * N_OUT for _ in BUCKETS] for _ in HORIZONS]
-    for j in range(n):
-        # recency weight of the later read
-        rw = 0.5 ** ((t0 - times[j]) / (hl * 3600.0)) if hl else 1.0
-        for i in range(j):
-            dh = (times[j] - times[i]) / 3600.0
-            if dh <= 0.0 or dh > max_gap:
-                continue
-            hw = [math.exp(-0.5 * ((dh - h) / hsig) ** 2) for h in HORIZONS]
-            if max(hw) < 0.01:
-                continue
-            ri, rj = rank_of[i], rank_of[j]
-            for uid, r in ri.items():
-                out = rj.get(uid)
-                if out is None:
-                    o = 11  # left the chart
-                elif out <= 10:
-                    o = out - 1
-                else:
-                    o = 10
-                bw = bucket_weights(r)
-                for hi, w in enumerate(hw):
-                    if w < 0.01:
-                        continue
-                    ww = w * rw
-                    for bi, bf in bw:
-                        counts[hi][bi][o] += ww * bf
-    # normalise to distributions (with Laplace prior)
-    prior = p["prior"]
-    dist = []
-    for hi in range(len(HORIZONS)):
-        row = []
-        for bi in range(len(BUCKETS)):
-            c = [counts[hi][bi][o] + prior for o in range(N_OUT)]
-            s = sum(c)
-            row.append([x / s for x in c])
-        dist.append(row)
-
-    # trapezoid weights over the horizon grid (uniform over the 72h window)
-    hw = []
-    for idx, h in enumerate(HORIZONS):
-        prev_h = HORIZONS[idx - 1] if idx > 0 else 0
-        next_h = HORIZONS[idx + 1] if idx + 1 < len(HORIZONS) else 72
-        hw.append((min(next_h, 72) - max(prev_h, 0)) / 2.0)
-    hw_sum = sum(hw)
-    hw = [x / hw_sum for x in hw]
-
-    # --- per-game distributions, averaged over horizons ---
-    last_ranks = rank_of[-1]
-    last_tt = tt_of[-1]
-    last_tpn = tpn_of[-1]
-    # created dates (recorder rows carry details; archive rows do not)
-    created = {}
-    first_seen = {}
-    for idx, r in enumerate(reads):
-        for g in r["up_and_coming"]:
-            first_seen.setdefault(g["universe_id"], times[idx])
-        det = r.get("details") or {}
-        for k, v in det.items():
-            if isinstance(v, dict) and v.get("created"):
-                uid = int(k) if isinstance(k, str) else k
-                created[uid] = parse_time(v["created"])
-    probs = {}  # uid -> [p(place 1..10)]
-    for uid, r0 in sorted(last_ranks.items()):
-        bw = bucket_weights(r0)
-        avg = [0.0] * 10
-        expiry = (created.get(uid) or first_seen.get(uid, t0)) + CHART_DAYS * 86400.0
-        for hi, h in enumerate(HORIZONS):
-            if h == 0:
-                # at h=0 the chart is exactly the last read
-                if 1 <= r0 <= 10:
-                    avg[r0 - 1] += hw[hi]
-                continue
-            if t0 + h * 3600.0 > expiry:
-                continue  # aged out before this horizon
-            for bi, bf in bw:
-                d = dist[hi][bi]
-                for k in range(10):
-                    avg[k] += hw[hi] * bf * d[k]
-        # cross-chart rank shifts (variant, default 0)
-        shift = 0.0
-        if uid in last_tt:
-            shift += p["tt_shift_top"] if r0 <= 10 else p["tt_shift_mid"]
-        if uid in last_tpn and r0 <= 10:
-            shift += p["tpn_shift_top"]
-        if shift:
-            avg = shift_dist(avg, shift)
-        probs[uid] = avg
-
-    # --- assemble rows: top max_named per place, honest probabilities ---
-    places = task.get("places", 10)
-    rows = []
-    for k in range(places):
-        cands = sorted(probs.items(), key=lambda kv: (-kv[1][k], kv[0]))
-        cands = [(uid, pr[k]) for uid, pr in cands if pr[k] > 0.0005]
-        cands = cands[: p["max_named_per_place"]]
-        total = sum(pr for _, pr in cands)
-        target = p["scale_target"]
-        if target is not None and total > 0:
-            f = min(target / total, 1.0) if total > target else target / total
-            # scale up only if it does not push any single p above 0.95
-            if total < target:
-                f = min(f, 0.95 / max(pr for _, pr in cands))
-            cands = [(uid, pr * f) for uid, pr in cands]
-        for uid, pr in cands:
-            rows.append({"universe_id": uid, "place": k + 1, "p": round(pr, 6)})
-    rows.sort(key=lambda r: (r["place"], -r["p"], r["universe_id"]))
-
-    # top10: order games by expected place (lowest expected rank first)
-    def expected_rank(uid):
-        pr = probs[uid]
-        tot = sum(pr)
-        if tot <= 0:
-            return 999.0
-        return sum((k + 1) * pr[k] for k in range(10)) / tot
-
-    top10 = [uid for uid, _ in sorted(probs.items(), key=lambda kv: (expected_rank(kv[0]), kv[0]))[:places]]
-    return {"probabilities": rows, "top10": top10}
-
-
-def shift_dist(dist10, shift):
-    """Shift a 10-place distribution by `shift` places (fractional, linear)."""
-    out = [0.0] * 10
-    for k, v in enumerate(dist10):
-        if v == 0.0:
-            continue
-        pos = k + shift
-        if pos < 0:
-            out[0] += v
-        elif pos > 9:
-            continue  # falls out of the top 10
-        else:
-            lo = int(math.floor(pos))
-            frac = pos - lo
-            out[lo] += v * (1.0 - frac)
-            if lo + 1 < 10:
-                out[lo + 1] += v * frac
-    return out
-
+def parse_iso(dt_str):
+    if not dt_str:
+        return None
+    # Handle 'Z' and fractional seconds
+    if dt_str.endswith('Z'):
+        dt_str = dt_str[:-1] + '+00:00'
+    try:
+        return datetime.fromisoformat(dt_str)
+    except Exception:
+        return None
 
 def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    with open(os.path.join(in_dir, "task.json"), "r", encoding="utf-8") as f:
+    input_dir = os.environ.get('MAKEFUN_INPUT_DIR', '/input')
+    output_dir = os.environ.get('MAKEFUN_OUTPUT_DIR', '/output')
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(os.path.join(input_dir, 'task.json'), 'r', encoding='utf-8') as f:
         task = json.load(f)
+
+    history_path = os.path.join(input_dir, 'history.ndjson')
     reads = []
-    with open(os.path.join(in_dir, "history.ndjson"), "r", encoding="utf-8") as f:
+    with open(history_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if line:
                 reads.append(json.loads(line))
-    forecast = build_forecast(reads, task)
-    out_path = os.path.join(out_dir, task.get("output", "forecast.json"))
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(forecast, sort_keys=True) + "\n")
 
+    # Thin history to at most 200 reads (deterministic stride, always keeping the last read)
+    if len(reads) > 200:
+        step = math.ceil(len(reads) / 200)
+        thinned_indices = [i for i in range(len(reads)) if i % step == 0 or i == len(reads) - 1]
+        reads = [reads[i] for i in thinned_indices]
 
-if __name__ == "__main__":
+    # Parse read timestamps and up_and_coming charts
+    parsed_reads = []
+    first_seen = {}
+    game_created = {}
+
+    for idx, r in enumerate(reads):
+        at_dt = parse_iso(r.get('at'))
+        up_list = r.get('up_and_coming', []) or []
+        details = r.get('details') or {}
+        
+        ranks = {}
+        for item in up_list:
+            uid = item.get('universe_id')
+            rank = item.get('rank')
+            if uid is not None and rank is not None:
+                ranks[uid] = rank
+                if uid not in first_seen and at_dt:
+                    first_seen[uid] = at_dt
+
+        # Check details for created time
+        # details can be a dict mapping uid (str or int) to detail dict
+        if isinstance(details, dict):
+            for k, d in details.items():
+                if isinstance(d, dict):
+                    try:
+                        uid_int = int(k)
+                    except ValueError:
+                        uid_int = None
+                    created_str = d.get('created')
+                    if created_str and at_dt:
+                        cdt = parse_iso(created_str)
+                        if cdt:
+                            if uid_int is not None:
+                                game_created[uid_int] = cdt
+                            # also check items in up_list matching uid
+        for item in up_list:
+            uid = item.get('universe_id')
+            # sometimes details is keyed differently or item itself has created
+            if uid and uid not in game_created:
+                # check if details has uid as key
+                d = details.get(str(uid)) or details.get(uid)
+                if isinstance(d, dict) and d.get('created'):
+                    cdt = parse_iso(d.get('created'))
+                    if cdt:
+                        game_created[uid] = cdt
+
+        parsed_reads.append({
+            'at': at_dt,
+            'ranks': ranks,
+            'snapshot': r
+        })
+
+    # Determine expiry for each game: created (else first seen) + 28 days
+    expiry = {}
+    latest_at = parsed_reads[-1]['at'] if parsed_reads else datetime.now(timezone.utc)
+    for uid, fs in first_seen.items():
+        c_dt = game_created.get(uid, fs)
+        expiry[uid] = c_dt + timedelta(days=28)
+
+    # Horizon grid H
+    H = [0, 2, 4, 6, 9, 12, 18, 24, 36, 48, 60, 72]
+    
+    # Rank buckets: exact ranks 1..10, then coarser centres 13, 18, 25, 40, 70, 97
+    centers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 18, 25, 40, 70, 97]
+
+    def get_bucket_weights(r):
+        if r <= 1:
+            return {1: 1.0}
+        if r >= 97:
+            return {97: 1.0}
+        # Find interval
+        for k in range(len(centers) - 1):
+            c1 = centers[k]
+            c2 = centers[k+1]
+            if c1 <= r <= c2:
+                if c1 == c2:
+                    return {c1: 1.0}
+                w2 = (r - c1) / (c2 - c1)
+                w1 = 1.0 - w2
+                res = {c1: w1}
+                if w2 > 0:
+                    res[c2] = w2
+                return res
+        return {97: 1.0}
+
+    # Outcomes: 0..9 for future place 1..10, 10 for rank 11..97, 11 for left chart
+    num_outcomes = 12
+
+    # counts[h_idx][bucket][outcome]
+    # Initialize transition counts with Laplace prior of 1.0 later, or accumulate raw counts first.
+    # To accumulate: counts[h][b][o]
+    raw_counts = {}
+    for h in H:
+        raw_counts[h] = {b: [0.0] * num_outcomes for b in centers}
+
+    # Loop over pairs i < j
+    n_reads = len(parsed_reads)
+    for i in range(n_reads):
+        ri = parsed_reads[i]
+        ti = ri['at']
+        if not ti:
+            continue
+        ranks_i = ri['ranks']
+
+        for j in range(i + 1, n_reads):
+            rj = parsed_reads[j]
+            tj = rj['at']
+            if not tj:
+                continue
+            dt = (tj - ti).total_seconds() / 3600.0
+            if dt < 0 or dt > 84:
+                continue
+
+            # Recency weight on later read j (half-life 168 hours relative to latest_at)
+            # w_rec = 2 ** (- (latest_at - tj).total_seconds() / (168 * 3600))
+            # Or relative to ti or latest_at? Rule 3: "a recency weight on the later read with half-life 168 hours"
+            # Let's use 2 ** (- (latest_at - tj).total_seconds() / (168 * 3600))
+            age_j_hours = (latest_at - tj).total_seconds() / 3600.0
+            w_rec = 2.0 ** (-max(0.0, age_j_hours) / 144.0)
+
+            ranks_j = rj['ranks']
+
+            # For each game in ranks_i
+            for uid, rank_val in ranks_i.items():
+                exp_dt = expiry.get(uid, ti + timedelta(days=28))
+                
+                b_weights = get_bucket_weights(rank_val)
+
+                # Determine future outcome at j
+                if uid not in ranks_j:
+                    outcome = 11 # left chart
+                else:
+                    fut_rank = ranks_j[uid]
+                    if 1 <= fut_rank <= 10:
+                        outcome = fut_rank - 1
+                    else:
+                        outcome = 10 # rank 11..97
+
+                for h_idx, h in enumerate(H):
+                    # Check age-out: if expiry is before ti + h, skip
+                    if ti + timedelta(hours=h) > exp_dt:
+                        continue
+
+                    gauss = math.exp(-((dt - h) ** 2) / (2.0 * (5.5 ** 2)))
+                    if gauss < 0.01:
+                        continue
+
+                    weight = gauss * w_rec
+                    for b, bw in b_weights.items():
+                        raw_counts[h][b][outcome] += bw * weight
+
+    # Add Laplace prior of 1.0 to every outcome count, then normalize
+    transition_probs = {}
+    for h in H:
+        transition_probs[h] = {}
+        for b in centers:
+            counts = [c + 1.0 for c in raw_counts[h][b]]
+            total = sum(counts)
+            transition_probs[h][b] = [c / total for c in counts]
+
+    # Trapezoid weights over horizon grid H
+    # H = [0, 2, 4, 6, 9, 12, 18, 24, 36, 48, 60, 72]
+    trap_widths = []
+    n_h = len(H)
+    for k in range(n_h):
+        if k == 0:
+            w = (H[1] - H[0]) / 2.0
+        elif k == n_h - 1:
+            w = (H[k] - H[k-1]) / 2.0
+        else:
+            w = (H[k+1] - H[k-1]) / 2.0
+        trap_widths.append(w)
+    total_w = sum(trap_widths)
+    trap_weights = [w / total_w for w in trap_widths]
+
+    # Last read chart for baseline / horizon 0 / active games
+    last_read = parsed_reads[-1]
+    last_ranks = last_read['ranks']
+    # Sort chart by rank
+    sorted_chart_uids = sorted(last_ranks.keys(), key=lambda uid: last_ranks[uid])
+
+    # Compute expected probabilities for each game currently on chart (or active)
+    # We evaluate all games in last_ranks (and any active game)
+    game_probs = {} # uid -> {place: prob}
+
+    active_uids = set(last_ranks.keys())
+    # Also add any game seen in recent reads if needed, but last read chart games are primary
+    for uid in active_uids:
+        rank_val = last_ranks[uid]
+        b_weights = get_bucket_weights(rank_val)
+
+        # For each place 1..10 (outcome 0..9)
+        place_probs = {p: 0.0 for p in range(1, 11)}
+
+        for p in range(1, 11):
+            outcome = p - 1
+            # Average over horizon grid using trap_weights
+            p_val = 0.0
+            for k, h in enumerate(H):
+                # At horizon 0, rule 7: "At horizon 0 the chart is exactly the last read (the game at rank k has probability 1 at place k)."
+                if h == 0:
+                    # If game was at rank k in last read, and place p == k, prob is 1.0, else 0.0
+                    h_prob = 1.0 if rank_val == p else 0.0
+                else:
+                    # Sum over bucket weights
+                    h_prob = 0.0
+                    for b, bw in b_weights.items():
+                        h_prob += bw * transition_probs[h][b][outcome]
+                
+                p_val += trap_weights[k] * h_prob
+            
+            place_probs[p] = max(0.0, p_val)
+
+        game_probs[uid] = place_probs
+
+    # Assemble rows for probabilities (Rule 10)
+    # "for each place 1..10, take the games with the highest probability at that place (probability above 0.0005),
+    # at most 18 per place, and renormalise each place's named mass to 0.75 (so 0.25 is left unnamed for the long tail).
+    # Round each p to 6 decimals. Sort rows by place, then descending p, then universe_id."
+    probabilities_rows = []
+
+    for p in range(1, 11):
+        place_candidates = []
+        for uid, p_dict in game_probs.items():
+            val = p_dict.get(p, 0.0)
+            if val > 0.0005:
+                place_candidates.append((val, uid))
+        
+        # Sort descending by p, then ascending by universe_id
+        place_candidates.sort(key=lambda x: (-x[0], x[1]))
+        place_candidates = place_candidates[:18]
+
+        if place_candidates:
+            total_mass = sum(v for v, uid in place_candidates)
+            if total_mass > 0:
+                scale = 0.75 / total_mass
+                for val, uid in place_candidates:
+                    p_rounded = round(val * scale, 6)
+                    probabilities_rows.append({
+                        "universe_id": int(uid),
+                        "place": int(p),
+                        "p": float(p_rounded)
+                    })
+
+    # Sort rows by place, then descending p, then universe_id
+    probabilities_rows.sort(key=lambda r: (r['place'], -r['p'], r['universe_id']))
+
+    # Top10 (Rule 11):
+    # "order the games by expected place (sum over places of place * p(place), divided by the game's total probability over the 10 places),
+    # lowest first, and take the first 10."
+    game_scores = []
+    for uid in active_uids:
+        p_dict = game_probs.get(uid, {p: 0.0 for p in range(1, 11)})
+        total_p = sum(p_dict.values())
+        if total_p > 0:
+            weighted_sum = sum(p * p_dict[p] for p in range(1, 11))
+            expected_place = weighted_sum / total_p
+        else:
+            expected_place = 999.0
+        game_scores.append((expected_place, uid))
+
+    # Sort by expected place ascending, then universe_id ascending
+    game_scores.sort(key=lambda x: (x[0], x[1]))
+    top10 = [int(uid) for _, uid in game_scores[:10]]
+
+    # Ensure top10 has exactly 10 distinct universe ids (fallback to sorted_chart_uids if needed)
+    if len(top10) < 10:
+        for uid in sorted_chart_uids:
+            if uid not in top10:
+                top10.append(int(uid))
+                if len(top10) == 10:
+                    break
+
+    output_data = {
+        "probabilities": probabilities_rows,
+        "top10": top10
+    }
+
+    out_file = os.path.join(output_dir, task.get('output', 'forecast.json'))
+    with open(out_file, 'w', encoding='utf-8') as f:
+        json.dump(output_data, f, separators=(',', ':'))
+
+if __name__ == '__main__':
     main()
